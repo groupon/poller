@@ -1,0 +1,185 @@
+#!/usr/bin/env ruby
+# poller - poll a URL, and trigger a program on changes
+# Andrew Ho (ho@groupon.com)
+#
+# Copyright (c) 2012, Groupon, Inc.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+#
+# Neither the name of GROUPON nor the names of its contributors may be
+# used to endorse or promote products derived from this software without
+# specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+# TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+require 'logger'
+require 'optparse'
+require 'poller'
+
+$ME    = File.basename($0)
+$USAGE = "usage: #$ME [-h] [-v] [#{$ME}_opts] url program [program_opts]"
+$HELP  = <<"end"
+
+#$USAGE
+
+#$ME is a command line utility that continuously fetches an HTTP URL,
+saving its response body to local file. The first time the URL is
+fetched, or whenever the response body changes, #$ME runs another
+command, with the filename of the local file as an argument.
+
+There are two required command line arguments: a URL to fetch, and a
+program to run when that URL's contents are changed. In addition, a
+number of optional command line arguments can be usd
+
+Options:
+    -h, --help        display this help text and exit
+    -s, --silent      silent mode, do not emit program output
+    -v, --verbose     verbose mode, show debug messages on stderr
+    -i, --interval    pause this many seconds between URL fetches
+    -t, --timeout     fail out URL fetch after this many seconds
+    -b, --backoff     pause this many seconds on error response
+    -d, --cache_dir   store cached file in this dir (default tempdir)
+    -f, --master_file filename of cached master file (default tempdir)
+    -I, --replace     in program_opts, replace this text with the filename
+    program           the program to run when URL content changes
+    program_opts      optional additional arguments for the program to run
+
+Examples:
+    #$ME -i 30 -t 60 http://example.com/foo.txt echo
+    #$ME http://example.com/bar.json /path/to/process_json
+    #$ME -I FILE http://example.com/baz.xml -- sh -c 'cat FILE | process_xml'
+
+end
+
+def main(argv)
+  logger = Logger.new($stderr)
+  logger.level = Logger::FATAL
+
+  opts = {}
+  silent = false
+  replace = nil
+  url = nil
+  program = nil
+  program_opts = []
+
+  orig_argv = argv.dup
+  OptionParser.new do |o|
+    o.on('-h', '--help') { puts $HELP; exit 0 }
+    o.on('-v', '--verbose') do
+      logger.level = Logger::DEBUG
+      opts[:logger] = logger
+      logger.debug "#{([$0] + orig_argv).inspect}"
+    end
+    o.on('-i', '--interval=f')    { |v| opts[:interval] = v.to_f }
+    o.on('-t', '--timeout=f')     { |v| opts[:timeout] = v.to_f }
+    o.on('-b', '--backoff=f')     { |v| opts[:backoff] = v.to_f }
+    o.on('-d', '--cache_dir=s')   { |v| opts[:cache_dir] = v }
+    o.on('-f', '--master_file=s') { |v| opts[:master_file] = v }
+    o.on('-I', '--replace=s')     { |v| replace = v }
+    begin
+      o.parse! argv
+    rescue OptionParser::InvalidOption => e
+      abort "#$ME: #{e}\n#$USAGE"
+    end
+  end
+  abort "#$ME: missing required URL\n#$USAGE" if argv.empty?
+  url = argv.shift
+  abort "#$ME: missing required program\n#$USAGE" if argv.empty?
+  program = argv.shift
+  # program_opts is set inside Poller code block
+  logger.debug "program = #{program.inspect}; argv = #{argv.inspect}"
+
+  poller = Poller.new(url, opts)
+  retval = -1
+  begin
+    poller.run do |fh|
+      if logger.debug?
+        printed = false
+        fh.each do |line|
+          logger.debug 'response body:' unless printed
+          logger << "  || #{line}"
+          printed = true
+        end
+        logger.debug 'empty response body' unless printed
+      end
+      fh.close
+      filename = fh.path
+      if replace
+        program_opts = argv.collect { |s| s.sub(replace, filename) }
+      else
+        program_opts = argv.dup << filename
+      end
+      printed = false
+      retval = run_command(program, *program_opts) do |line|
+        logger.debug 'program output:' unless printed
+        logger << "  || #{line}" if logger.debug?
+        puts line unless silent
+        printed = true
+      end
+      logger.debug "retval = #{retval}#{printed ? '' : '; no program output'}"
+      retval == 0
+    end
+    return retval
+  rescue Interrupt
+    logger.info 'terminating on SIGINT'
+    retval = 0
+  end
+  retval
+end
+
+
+# run_command(cmd, arg1, arg2, ...) safely runs a command without using
+# a Unix command shell. This means any wildcards, quotes, redirections,
+# and so on in the command name or arguments are not interpreted by a
+# shell, and are passed directly to the command being run.
+#
+# Accepts a block of code to run, and sets $? to the return status of
+# the process. Dies if the command cannot be executed.
+
+def run_command(cmd, *args)
+  raise ArgumentError.new('missing required cmd to run') if cmd.nil?
+  rd, wr = IO.pipe
+  if fork
+    wr.close
+    if block_given?
+      rd.each { |line| yield(line) }
+    else
+      rd.read
+    end
+    rd.close
+    Process.wait
+    return $?
+  else
+    rd.close
+    $stdin.close
+    $stdout.reopen(wr)
+    $stderr.reopen(wr)
+    exec cmd, *args
+    raise "exec #{cmd} failed"
+  end
+end
+
+
+# Run main loop and exit
+
+exit main ARGV
