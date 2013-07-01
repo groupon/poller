@@ -35,7 +35,7 @@ Use it in Ruby code:
     require 'rubygems'
     require 'poller'
     
-    Poller.new('http://example.com/foo.json') do |fh|
+    Poller.new('http://example.com/foo.json').run do |fh|
       json = fh.read
       # Do something with json...
     end
